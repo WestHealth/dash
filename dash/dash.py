@@ -49,6 +49,7 @@ from ._utils import (
 )
 from . import _validate
 from . import _watch
+from ._callback_context import callback_context
 
 _flask_compress_version = parse_version(get_distribution("flask-compress").version)
 
@@ -1051,6 +1052,179 @@ class Dash(object):
             return add_context
 
         return wrap_func
+
+
+    class callback_dict(dict):
+        """
+        This class is a convenience class to work with dict_callback. It extends the
+        builtin dict class by adding three methods that can be used to more easily
+        interact with pattern matching component ids.
+
+        The private method _property_key_key converts an id/property dict to
+        our internal dict label. String id components have their property are
+        mapped to 'id.property' while pattern matched id's are flattened using
+        frozenset which guarantees the id dict will map to the same immutable object
+        regardless of the order of the keys. We use the hashable tuple
+        (frozenset, property) as the key. This mapping is centralize here.
+
+        The method pget is intended to be used with pattern matched components
+        but can be used with string id components. It can be accessed in two ways
+        the id can be supplied with the property or as long as there isn't a name
+        collision with the named parameters, the id components can be supplied by
+        themselves. For example, input.pget({type: 'btn', index: 1}, 'n_clicks')
+        or input.pget(type='btn', index=1, property='n_clicks') can be used.
+
+        The method pset is also mainly a pattern matched component convenience.
+        It sets a value in the dictionary. And has two modes of operation similar to pget.
+
+        Finally, pkeys unpacks all the pattern matched id/property into tuples of
+        ids and properties. But only lists the pattern matched component ids.
+        """
+        @classmethod
+        def _property_to_key(cls, prop):
+            """Converts the property to our key format for dictionaries"""
+            if type(prop['id']) == dict:
+                return (frozenset(prop['id'].items()),prop['property'])
+            else:
+                return f"{prop['id']}.{prop['property']}"
+
+        def pget(self, id_=None, property=None, **kwargs):
+            if not id_:
+                id_=kwargs
+            return self[self._property_to_key(dict(id=id_, property=property))]
+            
+        def pset(self, key=None, property=None, value=None, **kwargs):
+            if not key:
+                key=kwargs
+            self[self._property_to_key(dict(id=key, property=property))]=value
+
+        def pkeys(self):
+            return [(dict(k[0]), k[1]) for k in self.keys() if isinstance(k, tuple)]
+        
+    def dict_callback(self, *_args, **_kwargs):
+        """
+        Normally used as a decorator, `@app.dict_callback` provides a server-side
+        callback relating the values of one or more `Output` items to one or
+        more `Input` items which will trigger the callback when they change,
+        and optionally `State` items which provide additional information but
+        do not trigger the callback directly.
+        
+        This differs from the standard callback because the callback function 
+        receives as input an input and state dictionary and generates as output 
+        an output dictionary. They keys in a dictionary are of the form "id.property"
+        for standard Inputs, States, and Outputs and "type#index.property" for pattern
+        matched Inputs and States.
+        
+        This decorator accepts any keyword arguments the standard callback method does 
+        including the optional argument 'prevent_initial_call'. In addition, two
+        additional optional callback arguments are added 'strict' and 'allow_missing'.
+
+        The optional argument `prevent_initial_call` causes the callback
+        not to fire when its outputs are first added to the page. Defaults to
+        `False` unless `prevent_initial_callbacks=True` at the app level.
+
+        The 'strict' argument causes the callback to raise a KeyError if the callback
+        returns a key in the dictionary that is not expected as an Output. Defaults to 
+        'False'.
+        
+        The 'allow_missing' argument returns a 'no_update'. For any keys missing when
+        in the output returned by the callback. If 'False' a KeyError is raised if
+        any keys are missing in the output dictionary. Defaults to 'True'.
+        """
+
+        # Pull new options out of the keyword arguments
+        strict = _kwargs.pop('strict', False)
+        allow_missing = _kwargs.pop('allow_missing', True)
+
+        #
+        # Helper Functions
+        #
+
+        # property_to_key is defined in the callback_dict class. Rather than
+        # making two copies we refer to the original for maintainablility
+        property_to_key = self.callback_dict._property_to_key
+        
+        def to_dict(in_, prop_list, recurse=True):
+            """
+            Maps an values input list to a dict based on the list of properties.
+            We allow one level of recursion since pattern matching allows for a list of lists.
+            """
+            if len(in_) != len(prop_list):
+                raise ValueError("List must have the same number of elements as keys")
+            out_dict = self.callback_dict()
+            for prop, value in zip(prop_list, in_):
+                if isinstance(prop, (list, tuple)) and recurse:
+                    out_dict.update(to_dict(value, prop, recurse=False))
+                else:
+                    out_dict[property_to_key(prop)] = value
+            return out_dict
+
+        def get_keys_from_list(prop_list, recurse=True):
+            """
+            Converts a list of properties to a list of keys. This is for 'strict' validation.
+            We allow one level of recurse for pattern matching.
+            """
+            out_list = []
+            for prop in prop_list:
+                if isinstance(prop, (list, tuple)) and recurse:
+                    out_list += get_keys_from_list(prop_list, recurse=False)
+                else:
+                    out_list.append(property_to_key(prop))
+            return out_list
+
+        def from_dict(output_values, prop_list, recurse=True):
+            """
+            Maps output_values dict to a list based on the list of properties. 
+            For symmetry sake, we allow one level of recursion, but pattern matching on outputs
+            doesn't support any kind of list of list. 
+            """
+            # A single property may appear not as a so we make it a list for consistent processing.
+
+            if not isinstance(prop_list, (list, tuple)):
+                prop_list = [prop_list]
+
+            out_list = []
+            for prop in prop_list:
+                if isinstance(prop, (list, tuple)) and recurse:
+                    out_list.append(from_dict(output_values, prop, recurse=False))
+                else:
+                    if allow_missing:
+                        out_list.append(output_values.get(property_to_key(prop), no_update))
+                    else:  # Throw Key error if value is missing
+                        out_list.append(output_values[property_to_key(prop)])
+
+            return out_list
+
+        def decorator(func):
+            @wraps(func)
+            def wrapped_func(*args, **kwargs):
+                ctx = callback_context
+                inputs = to_dict(args[0:len(ctx.inputs_list)], ctx.inputs_list)
+                state = to_dict(args[len(ctx.inputs_list):], ctx.states_list)
+                output_dict = func(inputs, state, **kwargs)  # %% callback invoked %%
+                # As with standard callback, we still support the returning of a single
+                # no_update to prevent updating
+
+                if isinstance(output_dict, _NoUpdate):
+                    raise PreventUpdate
+
+                output_value = from_dict(output_dict, ctx.outputs_list)
+                if strict:
+                    # Check to see if there are any excess keys in strict mode
+                    excess_keys = set(output_dict.keys()) - set(get_keys_from_list(ctx.outputs_list))
+                    if excess_keys:
+                        raise KeyError(f'The following keys were note found {",".join(list(excess_keys))}')
+
+                # If the expected output is not a list we need to unwrap it from our list
+
+                if not isinstance(ctx.outputs_list, (list, tuple)):
+                    output_value = output_value[0]
+
+                return output_value
+
+            return self.callback(*_args, **_kwargs)(wrapped_func)
+
+        return decorator
 
     def dispatch(self):
         body = flask.request.get_json()
